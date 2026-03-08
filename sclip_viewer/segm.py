@@ -3,7 +3,7 @@ import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageOps
 from torchvision import transforms
 from sclip_viewer import clip_for_segm
 from sclip_viewer.upsample import UPA 
@@ -49,8 +49,8 @@ class CLIPForSegmentation:
             logit_scale=45, 
             slide_stride=112, 
             slide_crop=224, 
-            area_thd=None,      # 修正：加上这个参数，解决 TypeError
-            use_template=False, # 修正：同步 gradio 中的参数
+            area_thd=None,      
+            use_template=False, 
             cls_token_lambda=-0.3
         ):
         self.data_preprocessor = CustomSegmDataPreProcessor(
@@ -96,16 +96,27 @@ class CLIPForSegmentation:
         preds = img_tensor.new_zeros((b, self.num_queries, h_img, w_img))
         count = img_tensor.new_zeros((b, 1, h_img, w_img))
         
-        for h_idx in range(max(h_img - crop + stride - 1, 0) // stride + 1):
-            for w_idx in range(max(w_img - crop + stride - 1, 0) // stride + 1):
+        # --- 增加进度显示逻辑 ---
+        h_steps = max(h_img - crop + stride - 1, 0) // stride + 1
+        w_steps = max(w_img - crop + stride - 1, 0) // stride + 1
+        total_steps = h_steps * w_steps
+        current_step = 0
+        print(f"\n[Slide] 开始滑动窗口推理，总计 {total_steps} 个切片")
+
+        for h_idx in range(h_steps):
+            for w_idx in range(w_steps):
+                current_step += 1
                 y2, x2 = min(h_idx * stride + crop, h_img), min(w_idx * stride + crop, w_img)
                 y1, x1 = max(y2 - crop, 0), max(x2 - crop, 0)
+                
+                print(f" >>> 正在处理第 {current_step}/{total_steps} 个切片 (位置: y={y1}:{y2}, x={x1}:{x2})")
                 
                 self.current_hr_guide = full_pil.crop((x1, y1, x2, y2))
                 crop_logits = self.forward_feature(img_tensor[:, :, y1:y2, x1:x2])
                 preds[:, :, y1:y2, x1:x2] += crop_logits
                 count[:, :, y1:y2, x1:x2] += 1
         
+        print(f"[Slide] 滑动窗口处理完毕\n")
         self.current_hr_guide = full_pil
         preds /= count.clamp_min(1.0)
         return F.interpolate(preds, size=img_metas[0]['ori_shape'][:2], mode='bilinear')
@@ -124,17 +135,22 @@ class CLIPForSegmentation:
         res = []
         for i in range(seg_logits.shape[0]):
             cur = (seg_logits[i] * self.logit_scale).softmax(0)
+            
             if self.num_classes != self.num_queries:
                 cls_map = F.one_hot(self.query_idx, self.num_classes).T.view(self.num_classes, self.num_queries, 1, 1)
                 cur = (cur.unsqueeze(0) * cls_map).max(1)[0]
-            p = cur.argmax(0, keepdim=True)
-            p[cur.max(0)[0] < self.prob_thd] = 0
+            
+            p = cur.argmax(0, keepdim=True)  
+            max_prob, _ = cur.max(0)
+            
+            # 维度匹配修正：针对 (H, W) 的 p[0] 应用掩码
+            p[0][max_prob < self.prob_thd] = 0
+            
             res.append(p)
         return res
 
     def infer_image(self, image: Image.Image):
-        # 自动旋转修复 (代替 _getexif 判断)
-        from PIL import ImageOps
+        # 自动旋转修复
         image = ImageOps.exif_transpose(image).convert("RGB")
             
         image_resized, prep_image = self.data_preprocessor(image)
@@ -142,5 +158,11 @@ class CLIPForSegmentation:
         tensor = prep_image.unsqueeze(0).to(device)
         
         preds = self.predict(inputs=tensor)
-        gc.collect(); torch.cuda.empty_cache()
+        
+        # 清理中间变量，防止显存积压
+        del tensor
+        self.current_hr_guide = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        
         return preds, image_resized

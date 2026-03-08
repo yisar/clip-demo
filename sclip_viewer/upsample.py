@@ -58,7 +58,7 @@ def UPA(HR_img, lr_modality):
             # 每 10 步打印一次进度
             if step % 10 == 0 or step == 1:
                 mem_used = torch.cuda.memory_allocated() / 1024**2
-                print(f"  > Step {step:2d}/50 | Loss: {loss.item():.6f} | GPU Mem: {mem_used:.1f}MB")
+                print(f"  > Step {step:2d}/20 | Loss: {loss.item():.6f} | GPU Mem: {mem_used:.1f}MB")
 
         # 5. 最终推理：使用学到的参数上采样真正的特征图
         model.eval()
