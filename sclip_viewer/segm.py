@@ -6,18 +6,16 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 from sclip_viewer import clip_for_segm
-from sclip_viewer.clip_for_segm.imagenet_template import openai_imagenet_template
+from sclip_viewer.upsample import UPA 
 
-# --- 辅助函数保持不变 ---
-def get_cls_idx(name_sets: ty.List[str]) -> tuple[list[str], list[int]]:
+def get_cls_idx(name_sets):
     num_cls = len(name_sets)
     class_names, class_indices = [], []
     for idx in range(num_cls):
         names_i = name_sets[idx].split(', ')
         class_names += names_i
         class_indices += [idx for _ in range(len(names_i))]
-    class_names = [item.replace('\n', '') for item in class_names]
-    return class_names, class_indices
+    return [n.replace('\n', '') for n in class_names], torch.tensor(class_indices)
 
 class CustomSegmDataPreProcessor:
     def __init__(self, mean, std, rgb_to_bgr=False, size=(2048, 448)):
@@ -25,20 +23,16 @@ class CustomSegmDataPreProcessor:
         self.std = torch.tensor(std).view(3, 1, 1) / 255.0
         self.rgb_to_bgr = rgb_to_bgr
         self.size = size 
-        self.to_tensor_func = transforms.ToTensor()
 
-    def aspect_ratio_preserving_resize(self, img: Image.Image):
-        target_w, target_h = self.size
-        orig_w, orig_h = img.size
-        scale = min(target_w / orig_w, target_h / orig_h)
-        new_w, new_h = int(orig_w * scale), int(orig_h * scale)
-        return img.resize((new_w, new_h), Image.BICUBIC)
-
-    def __call__(self, image: Image.Image) -> torch.Tensor:
-        image_resized = self.aspect_ratio_preserving_resize(image)
-        img_tensor = self.to_tensor_func(image_resized)
-        if self.rgb_to_bgr:
-            img_tensor = img_tensor[[2, 1, 0], :, :]
+    def __call__(self, image: Image.Image):
+        # 保持比例缩放
+        tw, th = self.size
+        ow, oh = image.size
+        scale = min(tw / ow, th / oh)
+        image_resized = image.resize((int(ow * scale), int(oh * scale)), Image.BICUBIC)
+        
+        img_tensor = transforms.ToTensor()(image_resized)
+        if self.rgb_to_bgr: img_tensor = img_tensor[[2, 1, 0], :, :]
         img_tensor = (img_tensor - self.mean) / self.std
         return image_resized, img_tensor
 
@@ -48,142 +42,105 @@ clip_for_segm_model.eval()
 
 class CLIPForSegmentation:
     def __init__(
-            self,
-            class_names: ty.List[str],
-            size: tuple[int, int],
-            prob_thd=0.2,       # 参考 SegEarth 调低阈值 (原 0.55)
-            logit_scale=45,     # 参考 SegEarth 调低 Scale (原 90)
-            slide_stride=28,
-            slide_crop=224,
-            area_thd=None,
-            use_template=False,
-            cls_token_lambda=-0.3 # 新增：用于增强局部特征响应
+            self, 
+            class_names: ty.List[str], 
+            size: tuple[int, int], 
+            prob_thd=0.2, 
+            logit_scale=45, 
+            slide_stride=112, 
+            slide_crop=224, 
+            area_thd=None,      # 修正：加上这个参数，解决 TypeError
+            use_template=False, # 修正：同步 gradio 中的参数
+            cls_token_lambda=-0.3
         ):
-        
         self.data_preprocessor = CustomSegmDataPreProcessor(
             mean=[122.771, 116.746, 104.094], std=[68.501, 66.632, 70.323],
             rgb_to_bgr=True, size=size
         )
+        self.current_hr_guide = None 
+        self.logit_scale, self.prob_thd = logit_scale, prob_thd
+        self.slide_stride, self.slide_crop = slide_stride, slide_crop
+        self.cls_token_lambda = cls_token_lambda
 
-        # 加载 AnyUp 模型
-        self.anyup = torch.hub.load('wimmerth/anyup', 'anyup_multi_backbone', use_natten=False).to(device)
-        self.anyup.eval()
-        
         query_words, self.query_idx = get_cls_idx(class_names)
-        self.num_queries = len(query_words)
-        self.num_classes = max(self.query_idx) + 1
-        self.query_idx = torch.Tensor(self.query_idx).to(torch.int64).to(device)
+        self.query_idx = self.query_idx.to(device)
+        self.num_queries, self.num_classes = len(query_words), self.query_idx.max().item() + 1
 
         query_features = []
         with torch.no_grad():
             for qw in query_words:
-                query = clip_for_segm.tokenize([temp(qw) for temp in openai_imagenet_template] if use_template else [qw]).to(device)
-                feature = clip_for_segm_model.encode_text(query)
-                feature /= feature.norm(dim=-1, keepdim=True)
-                feature = feature.mean(dim=0)
-                feature /= feature.norm()
-                query_features.append(feature.unsqueeze(0))
-        
+                tokens = clip_for_segm.tokenize([qw]).to(device)
+                feat = clip_for_segm_model.encode_text(tokens)
+                query_features.append((feat / feat.norm(dim=-1, keepdim=True)).mean(0, keepdim=True))
         self.query_features = torch.cat(query_features, dim=0)
-        self.dtype = self.query_features.dtype
-        self.logit_scale = logit_scale
-        self.prob_thd = prob_thd
-        self.area_thd = area_thd
-        self.slide_stride = slide_stride
-        self.slide_crop = slide_crop
-        self.cls_token_lambda = cls_token_lambda
 
+    def forward_feature(self, img_tensor):
+        with torch.no_grad():
+            image_features = clip_for_segm_model.encode_image(img_tensor, return_all=True, csa=True)
+            cls_token, patch_tokens = image_features[:, 0:1, :], image_features[:, 1:, :]
+            refined = (patch_tokens + self.cls_token_lambda * cls_token)
+            refined /= refined.norm(dim=-1, keepdim=True)
+            
+            ps = clip_for_segm_model.visual.patch_size
+            h_lr, w_lr = img_tensor.shape[-2] // ps, img_tensor.shape[-1] // ps
+            lr_feat = refined.permute(0, 2, 1).reshape(1, -1, h_lr, w_lr)
 
-    def forward_feature(self, img, logit_size=None):
-        if type(img) == list: img = img[0]
+        # 调用 UPA (自带 enable_grad)
+        hr_feat = UPA(self.current_hr_guide, lr_feat)
+        return torch.einsum('bchw,qc->bqhw', hr_feat.to(self.query_features.dtype), self.query_features)
 
-        # 1. 提取全量 CLIP 特征 (包含 CLS token)
-        image_features = clip_for_segm_model.encode_image(img, return_all=True, csa=True)
+    def forward_slide(self, img_tensor, img_metas):
+        stride, crop = self.slide_stride, self.slide_crop
+        full_pil = self.current_hr_guide
+        b, _, h_img, w_img = img_tensor.shape
+        preds = img_tensor.new_zeros((b, self.num_queries, h_img, w_img))
+        count = img_tensor.new_zeros((b, 1, h_img, w_img))
         
-        # 2. 特征重构 (核心优化点：参考 SegEarth 减去全局偏置)
-        cls_token = image_features[:, 0:1, :]   # (B, 1, C)
-        patch_tokens = image_features[:, 1:, :] # (B, L, C)
+        for h_idx in range(max(h_img - crop + stride - 1, 0) // stride + 1):
+            for w_idx in range(max(w_img - crop + stride - 1, 0) // stride + 1):
+                y2, x2 = min(h_idx * stride + crop, h_img), min(w_idx * stride + crop, w_img)
+                y1, x1 = max(y2 - crop, 0), max(x2 - crop, 0)
+                
+                self.current_hr_guide = full_pil.crop((x1, y1, x2, y2))
+                crop_logits = self.forward_feature(img_tensor[:, :, y1:y2, x1:x2])
+                preds[:, :, y1:y2, x1:x2] += crop_logits
+                count[:, :, y1:y2, x1:x2] += 1
         
-        # 局部特征增强逻辑
-        refined_patch_tokens = patch_tokens + self.cls_token_lambda * cls_token
-        refined_patch_tokens /= refined_patch_tokens.norm(dim=-1, keepdim=True)
-        
-        # 计算低分辨维度
-        patch_size = clip_for_segm_model.visual.patch_size
-        w_lr, h_lr = img.shape[-2] // patch_size, img.shape[-1] // patch_size
-        lr_feat = refined_patch_tokens.permute(0, 2, 1).reshape(-1, patch_tokens.shape[-1], w_lr, h_lr)
-
-        # 3. 精度对齐并进行 AnyUp 上采样
-        anyup_dtype = next(self.anyup.parameters()).dtype
-        img_input = img.to(anyup_dtype)
-        lr_feat = lr_feat.to(anyup_dtype)
-        target_size = logit_size if logit_size is not None else img.shape[-2:]
-        
-        # 上采样：利用原图结构指导特征对齐
-        hr_feat = self.anyup(img_input, lr_feat, output_size=target_size, q_chunk_size=128)
-        
-        # 4. 计算相似度矩阵
-        hr_feat = hr_feat.to(self.dtype)
-        logits = torch.einsum('bchw,qc->bqhw', hr_feat, self.query_features)
-
-        del image_features, lr_feat, hr_feat, refined_patch_tokens
-        gc.collect()
-        torch.cuda.empty_cache()
-        return logits
-
-    def forward_slide(self, img, img_metas, stride=112, crop_size=224):
-        # --- 保持原有逻辑，但内部会调用优化后的 forward_feature ---
-        if type(img) == list: img = img[0].unsqueeze(0)
-        stride = (stride, stride) if type(stride) == int else stride
-        crop_size = (crop_size, crop_size) if type(crop_size) == int else crop_size
-
-        h_stride, w_stride = stride
-        h_crop, w_crop = crop_size
-        batch_size, _, h_img, w_img = img.shape
-        preds = img.new_zeros((batch_size, self.num_queries, h_img, w_img))
-        count_mat = img.new_zeros((batch_size, 1, h_img, w_img))
-        
-        for h_idx in range(max(h_img - h_crop + h_stride - 1, 0) // h_stride + 1):
-            for w_idx in range(max(w_img - w_crop + w_stride - 1, 0) // w_stride + 1):
-                y2, x2 = min(h_idx * h_stride + h_crop, h_img), min(w_idx * w_stride + w_crop, w_img)
-                y1, x1 = max(y2 - h_crop, 0), max(x2 - w_crop, 0)
-                crop_seg_logit = self.forward_feature(img[:, :, y1:y2, x1:x2])
-                preds += nn.functional.pad(crop_seg_logit, (int(x1), int(w_img - x2), int(y1), int(h_img - y2)))
-                count_mat[:, :, y1:y2, x1:x2] += 1
-        
-        preds /= count_mat
-        img_size = img_metas[0]['ori_shape'][:2]
-        logits = nn.functional.interpolate(preds, size=img_size, mode='bilinear')
-
-        return logits
+        self.current_hr_guide = full_pil
+        preds /= count.clamp_min(1.0)
+        return F.interpolate(preds, size=img_metas[0]['ori_shape'][:2], mode='bilinear')
 
     def predict(self, inputs):
+        batch_img_metas = [dict(ori_shape=inputs.shape[2:])] * inputs.shape[0]
+        if self.slide_crop > 0:
+            seg_logits = self.forward_slide(inputs, batch_img_metas)
+        else:
+            seg_logits = self.forward_feature(inputs)
+            
         with torch.no_grad():
-            batch_img_metas = [dict(ori_shape=inputs.shape[2:])] * inputs.shape[0]
-            if self.slide_crop > 0:
-                seg_logits = self.forward_slide(inputs, batch_img_metas, self.slide_stride, self.slide_crop)
-            else:
-                seg_logits = self.forward_feature(inputs, batch_img_metas[0]['ori_shape'])
             return self.postprocess_result(seg_logits)
 
     def postprocess_result(self, seg_logits):
-        batch_size = seg_logits.shape[0]
-        seg_preds = []
-        for i in range(batch_size):
-            # 使用较低的 logit_scale 能保留更多 AnyUp 的细节
-            cur_logits = (seg_logits[i] * self.logit_scale).softmax(0)
-            
+        res = []
+        for i in range(seg_logits.shape[0]):
+            cur = (seg_logits[i] * self.logit_scale).softmax(0)
             if self.num_classes != self.num_queries:
-                cls_index = nn.functional.one_hot(self.query_idx, self.num_classes).T.view(self.num_classes, self.num_queries, 1, 1)
-                cur_logits = (cur_logits.unsqueeze(0) * cls_index).max(1)[0]
-            
-            # 阈值判定
-            seg_pred = cur_logits.argmax(0, keepdim=True)
-            seg_pred[cur_logits.max(0, keepdim=True)[0] < self.prob_thd] = 0
-            seg_preds.append(seg_pred)
-        return seg_preds
+                cls_map = F.one_hot(self.query_idx, self.num_classes).T.view(self.num_classes, self.num_queries, 1, 1)
+                cur = (cur.unsqueeze(0) * cls_map).max(1)[0]
+            p = cur.argmax(0, keepdim=True)
+            p[cur.max(0)[0] < self.prob_thd] = 0
+            res.append(p)
+        return res
 
-    def infer_image(self, image: Image.Image) -> tuple[list[torch.Tensor], Image.Image]:
+    def infer_image(self, image: Image.Image):
+        # 自动旋转修复 (代替 _getexif 判断)
+        from PIL import ImageOps
+        image = ImageOps.exif_transpose(image).convert("RGB")
+            
         image_resized, prep_image = self.data_preprocessor(image)
+        self.current_hr_guide = image_resized 
         tensor = prep_image.unsqueeze(0).to(device)
-        return self.predict(inputs=tensor), image_resized
+        
+        preds = self.predict(inputs=tensor)
+        gc.collect(); torch.cuda.empty_cache()
+        return preds, image_resized
