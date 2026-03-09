@@ -47,8 +47,8 @@ class CLIPForSegmentation:
             size: tuple[int, int], 
             prob_thd=0.2, 
             logit_scale=45, 
-            slide_stride=112, 
-            slide_crop=224, 
+            slide_stride=250, 
+            slide_crop=500, 
             area_thd=None,      # 修正：加上这个参数，解决 TypeError
             use_template=False, # 修正：同步 gradio 中的参数
             cls_token_lambda=-0.3
@@ -76,7 +76,7 @@ class CLIPForSegmentation:
 
     def forward_feature(self, img_tensor):
         with torch.no_grad():
-            image_features = clip_for_segm_model.encode_image(img_tensor, return_all=True, csa=True)
+            image_features = clip_for_segm_model.encode_image(img_tensor, return_all=True)
             cls_token, patch_tokens = image_features[:, 0:1, :], image_features[:, 1:, :]
             refined = (patch_tokens + self.cls_token_lambda * cls_token)
             refined /= refined.norm(dim=-1, keepdim=True)
